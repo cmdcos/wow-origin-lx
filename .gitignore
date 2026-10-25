@@ -1,0 +1,41 @@
+node_modules/
+docs/
+dist/
+data/*
+!data/.gitkeep
+!data/accounts.example.json
+cloudflare/generated/*
+!cloudflare/generated/lx-source.d.ts
+.wrangler/
+rewrite/generated/
+rewrite/dist/
+
+# 测试覆盖率报告
+coverage/
+*.lcov
+fetch.test.js
+result.test.json
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 本地系统和编辑器文件
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Tauri 桌面构建缓存与打包运行时
+.cache/
+desktop-runtime/
+src-tauri/target/
+src-tauri/binaries/
+src-tauri/gen/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/64x64.png
+src-tauri/icons/icon.png
+src-tauri/icons/StoreLogo.png
+src-tauri/icons/Square*Logo.png

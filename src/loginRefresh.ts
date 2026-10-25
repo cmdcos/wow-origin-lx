@@ -1,0 +1,330 @@
+import {
+  type AccountStoreInput,
+  type AccountSessionRegistry,
+  updateAccountCookieByAccessKey
+} from './accounts';
+import type { MusicPlatform } from './types';
+import { BadRequestError, UpstreamError } from './errors';
+import { refreshYTMusicCookie } from './ytmusic/login';
+import { clearYTMusicTrackCache } from './clients/YTMusicClient';
+
+const Logger = require('../core/Logger');
+
+const LOGIN_REFRESH_ROUTE = 'login/refresh';
+const LOGIN_CHECK_EXPIRED_ROUTE = 'login/check/expired';
+const REFRESH_HOUR = 1;
+const QQ_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const QQ_CHECK_RETRY_MS = 60 * 1000;
+
+/** QQ 账号下次授权检查时间，按 api_access_key 区分。 */
+export const qqNextLoginCheckAt = new Map<string, number>();
+const qqCheckedCookies = new Map<string, string>();
+const qqLoginChecksInFlight = new Map<string, Promise<void>>();
+
+type ResourcePlatform = 'qqmusic' | 'netease';
+
+interface MusicPlatformLike {
+  callModule(route: string, request: any): Promise<any>;
+}
+
+interface PlatformFactoryLike {
+  getPlatform(name: ResourcePlatform): MusicPlatformLike;
+}
+
+interface LoginRefreshOptions {
+  registry: AccountSessionRegistry;
+  platformFactory: PlatformFactoryLike;
+  workDir?: string;
+  accountStore?: AccountStoreInput;
+  logger?: any;
+  platform?: MusicPlatform;
+}
+
+export interface LoginRefreshSummary {
+  total: number;
+  refreshed: number;
+  unchanged: number;
+  failed: number;
+}
+
+export interface LoginRefreshScheduler {
+  start(): void;
+  stop(): void;
+  runNow(): Promise<LoginRefreshSummary>;
+}
+
+function toResourcePlatform(platform: MusicPlatform): ResourcePlatform {
+  return platform === 'qq' ? 'qqmusic' : 'netease';
+}
+
+function platformDisplayName(platform: MusicPlatform): string {
+  return platform === 'qq' ? 'QQ 音乐' : '网易云音乐';
+}
+
+function parseCookie(cookie: string): Record<string, string> {
+  const values: Record<string, string> = {};
+
+  String(cookie || '').split(';').forEach((item) => {
+    const separatorIndex = item.indexOf('=');
+    if (separatorIndex <= 0) return;
+
+    const key = item.slice(0, separatorIndex).trim();
+    const value = item.slice(separatorIndex + 1).trim();
+    if (key && value) values[key] = value;
+  });
+
+  return values;
+}
+
+function serializeCookie(values: Record<string, unknown>): string {
+  return Object.entries(values)
+    .filter(([key, value]) => key && value !== undefined && value !== null && String(value).trim())
+    .map(([key, value]) => `${key}=${String(value).trim()}`)
+    .join('; ');
+}
+
+function normalizeRefreshedCookie(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key, item]) => key && item !== undefined && item !== null && String(item).trim())
+  );
+}
+
+/** 计算距离进程本地时区下一次凌晨 01:00 的毫秒数。 */
+export function millisecondsUntilNextLoginRefresh(now: Date = new Date()): number {
+  const nextRefresh = new Date(now);
+  nextRefresh.setHours(REFRESH_HOUR, 0, 0, 0);
+
+  if (nextRefresh.getTime() <= now.getTime()) {
+    nextRefresh.setDate(nextRefresh.getDate() + 1);
+  }
+
+  return Math.max(1, nextRefresh.getTime() - now.getTime());
+}
+
+/** 主动刷新单个账号，绕过自动授权检查的时间间隔；失败时保留原凭证。 */
+export async function refreshLoginSession(
+  session: AccountSessionRegistry['sessions'][number],
+  { registry, platformFactory, workDir = process.cwd(), accountStore }: LoginRefreshOptions
+): Promise<{ refreshed: boolean }> {
+  const originalCookie = session.cookie;
+  if (!originalCookie.trim()) throw new BadRequestError('账号没有授权凭证，请先重新登录');
+  let refreshedCookie: string;
+  let androidIdentity: string | undefined;
+  let refreshed: boolean;
+
+  if (session.platform === 'ytmusic') {
+    refreshedCookie = await refreshYTMusicCookie(originalCookie);
+    refreshed = refreshedCookie !== originalCookie;
+  } else {
+    const resourcePlatform = toResourcePlatform(session.platform);
+    const displayName = platformDisplayName(session.platform);
+    const currentCookie = parseCookie(originalCookie);
+    let result: any;
+    try {
+      result = await platformFactory.getPlatform(resourcePlatform).callModule(LOGIN_REFRESH_ROUTE, {
+        query: {
+          ...currentCookie,
+          ...(session.deviceState ? { qq_android_identity: session.deviceState } : {}),
+          platform: resourcePlatform,
+          timestamp: Date.now()
+        },
+        body: {},
+        ip: 'internal-login-refresh',
+        connection: { remoteAddress: 'internal-login-refresh' }
+      });
+    } catch (error) {
+      throw new UpstreamError(`${displayName}授权刷新失败: ${(error as Error).message}`);
+    }
+    const upstreamCode = Number(result?.body?.code ?? 200);
+    if (!result || result.code !== 200 || upstreamCode !== 200) {
+      throw new UpstreamError(result?.message || result?.body?.message || result?.body?.msg || `${displayName}登录状态已过期，请重新登录`);
+    }
+    refreshed = result.refreshed !== false;
+    const refreshedValues = normalizeRefreshedCookie(result.cookie);
+    if (refreshed && Object.keys(refreshedValues).length === 0) {
+      throw new UpstreamError(`${displayName}刷新成功但未返回新的 cookie`);
+    }
+    refreshedCookie = serializeCookie({ ...currentCookie, ...refreshedValues });
+    androidIdentity = typeof result.androidIdentity === 'string' ? result.androidIdentity : undefined;
+  }
+
+  if (registry.byAccessKey.get(session.apiAccessKey) !== session) throw new BadRequestError('账号已删除');
+  if (session.cookie !== originalCookie) throw new BadRequestError('账号授权已变更，请重新刷新');
+  if (!refreshed) return { refreshed: false };
+
+  updateAccountCookieByAccessKey(
+    session.apiAccessKey, session.platform, refreshedCookie, registry, accountStore ?? workDir, androidIdentity
+  );
+  if (session.platform === 'qq') {
+    qqNextLoginCheckAt.delete(session.apiAccessKey);
+    qqCheckedCookies.delete(session.apiAccessKey);
+  }
+  if (session.platform === 'ytmusic') clearYTMusicTrackCache(originalCookie);
+  return { refreshed: true };
+}
+
+/**
+ * 顺序刷新指定平台已配置 cookie 的音乐账号，并将成功返回的新 cookie 同步到磁盘与内存。
+ * 上游失败、登录过期或没有返回非空 cookie 时只记录错误，保留原登录信息。
+ */
+export async function refreshLoginSessions({
+  registry,
+  platformFactory,
+  workDir = process.cwd(),
+  accountStore,
+  logger = new Logger({ component: 'login-refresh' }),
+  platform: selectedPlatform
+}: LoginRefreshOptions): Promise<LoginRefreshSummary> {
+  const sessions = registry.sessions.filter((session) => session.platform !== 'ytmusic' && session.cookie.trim() && (!selectedPlatform || session.platform === selectedPlatform));
+  const summary: LoginRefreshSummary = {
+    total: sessions.length,
+    refreshed: 0,
+    unchanged: 0,
+    failed: 0
+  };
+
+  if (sessions.length === 0) {
+    logger.info('没有需要刷新的音乐账号');
+    return summary;
+  }
+
+  for (const session of sessions) {
+    const displayName = platformDisplayName(session.platform);
+
+    try {
+      const { refreshed } = await refreshLoginSession(session, { registry, platformFactory, workDir, accountStore });
+      if (!refreshed) {
+        summary.unchanged += 1;
+        logger.info(`${displayName}账号 "${session.name}" 登录凭证仍有效，本次无需更新`);
+        continue;
+      }
+
+      summary.refreshed += 1;
+      logger.info(`${displayName}账号 "${session.name}" 登录状态刷新成功`);
+    } catch (error) {
+      summary.failed += 1;
+      logger.error(`${displayName}账号 "${session.name}" 登录状态刷新失败，已保留原 cookie`, error);
+    }
+  }
+
+  logger.info(`登录状态刷新完成：更新 ${summary.refreshed}，无需更新 ${summary.unchanged}，失败 ${summary.failed}`);
+  return summary;
+}
+
+/** 每个 QQ 账号每小时在首个 v1 请求前检查授权，过期时刷新并持久化凭证。 */
+export async function ensureQQLoginFresh(
+  session: AccountSessionRegistry['sessions'][number],
+  options: LoginRefreshOptions
+): Promise<void> {
+  if (session.platform !== 'qq' || !session.cookie.trim()) return;
+
+  const key = session.apiAccessKey;
+  const now = Date.now();
+  if (qqCheckedCookies.get(key) === session.cookie && now < (qqNextLoginCheckAt.get(key) ?? 0)) return;
+
+  const pending = qqLoginChecksInFlight.get(key);
+  if (pending) return pending;
+
+  const checkedCookie = session.cookie;
+  const check = (async () => {
+    const currentCookie = parseCookie(checkedCookie);
+    const result = await options.platformFactory.getPlatform('qqmusic').callModule(LOGIN_CHECK_EXPIRED_ROUTE, {
+      query: { ...currentCookie, platform: 'qqmusic', timestamp: Date.now() },
+      body: {},
+      ip: 'internal-login-check',
+      connection: { remoteAddress: 'internal-login-check' }
+    });
+    if (!result || result.code !== 200 || typeof result.expired !== 'boolean') {
+      throw new Error(result?.message || 'QQ 登录状态检查失败');
+    }
+    if (options.registry.byAccessKey.get(key) !== session || session.cookie !== checkedCookie) return;
+
+    if (result.expired) {
+      const summary = await refreshLoginSessions({
+        ...options,
+        registry: { sessions: [session], byAccessKey: options.registry.byAccessKey },
+        platform: 'qq'
+      });
+      if (summary.refreshed !== 1) throw new Error('QQ 登录凭证已过期且刷新失败');
+    }
+
+    if (options.registry.byAccessKey.get(key) !== session) return;
+    qqCheckedCookies.set(key, session.cookie);
+    qqNextLoginCheckAt.set(key, Date.now() + QQ_CHECK_INTERVAL_MS);
+  })();
+
+  qqLoginChecksInFlight.set(key, check);
+  try {
+    await check;
+  } catch (error) {
+    // 上游暂不可用时保留旧凭证，并限制后续请求的重试频率。
+    if (options.registry.byAccessKey.get(key) === session && session.cookie === checkedCookie) {
+      qqCheckedCookies.set(key, session.cookie);
+      qqNextLoginCheckAt.set(key, Date.now() + QQ_CHECK_RETRY_MS);
+    }
+    throw error;
+  } finally {
+    qqLoginChecksInFlight.delete(key);
+  }
+}
+
+/** 创建每天凌晨 01:00 执行的网易账号登录态刷新调度器。 */
+export function createLoginRefreshScheduler(options: LoginRefreshOptions): LoginRefreshScheduler {
+  const logger = options.logger || new Logger({ component: 'login-refresh' });
+  let timer: NodeJS.Timeout | undefined;
+  let running = false;
+  let started = false;
+
+  const scheduleNext = (): void => {
+    if (!started) return;
+    if (timer) clearTimeout(timer);
+
+    const delay = millisecondsUntilNextLoginRefresh();
+    const nextRefreshAt = new Date(Date.now() + delay);
+    timer = setTimeout(async () => {
+      if (running) {
+        logger.warn('上一次登录状态刷新仍在执行，本次任务已跳过');
+      } else {
+        running = true;
+        try {
+          await refreshLoginSessions({ ...options, platform: 'netease', logger });
+        } catch (error) {
+          logger.error('登录状态定时刷新任务执行失败', error);
+        } finally {
+          running = false;
+        }
+      }
+
+      if (started) scheduleNext();
+    }, delay);
+    timer.unref();
+
+    logger.info(`登录状态自动刷新已调度：${nextRefreshAt.toLocaleString()}`);
+  };
+
+  return {
+    start(): void {
+      if (started) return;
+      started = true;
+      scheduleNext();
+    },
+    stop(): void {
+      started = false;
+      if (!timer) return;
+      clearTimeout(timer);
+      timer = undefined;
+    },
+    runNow(): Promise<LoginRefreshSummary> {
+      return refreshLoginSessions({ ...options, platform: 'netease', logger });
+    }
+  };
+}
+
+export function clearAccountLoginRefresh(apiAccessKey: string): void {
+  qqNextLoginCheckAt.delete(apiAccessKey);
+  qqCheckedCookies.delete(apiAccessKey);
+  qqLoginChecksInFlight.delete(apiAccessKey);
+}
